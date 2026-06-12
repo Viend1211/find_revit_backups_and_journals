@@ -3,21 +3,24 @@
 $DocumentsPath = [Environment]::GetFolderPath("MyDocuments")
 $LocalAppData  = [Environment]::GetFolderPath("LocalApplicationData")
 $JournalRoot   = Join-Path $LocalAppData "Autodesk\Revit"
+$ReportPath    = Join-Path $DocumentsPath "Revit_Backup_Report.csv"
 
-$ReportPath = Join-Path $DocumentsPath "Revit_Backup_Report.csv"
+$FoundBackups     = 0
+$FoundRvt         = 0
+$DeletedBackups   = 0
+$SkippedBackups   = 0
+$FailedBackups    = 0
 
-$FoundBackups    = 0
-$FoundRvt        = 0
-$DeletedBackups  = 0
-$FailedDeletes   = 0
-$SkippedBackups  = 0
+$FoundJournals    = 0
+$DeletedJournals  = 0
+$FailedJournals   = 0
 
 $Results = @()
 
 Write-Host "Поиск backup папок..." -ForegroundColor Cyan
 
 $BackupFolders = Get-ChildItem -Path $DocumentsPath -Directory -Recurse -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -like "*_backup" }
+    Where-Object { $_.Name -like "*_backup" -and $_.Name -ne "_backup" }
 
 $FoundBackups = $BackupFolders.Count
 
@@ -27,87 +30,100 @@ foreach ($BackupFolder in $BackupFolders) {
 
     if ([string]::IsNullOrWhiteSpace($ModelName)) {
         $SkippedBackups++
-
-        $Results += [PSCustomObject]@{
-            BackupFolder = $BackupFolder.FullName
-            ModelName    = ""
-            ExpectedRvt  = ""
-            RvtExists    = $false
-            Deleted      = $false
-            Status       = "Skipped: empty model name"
-            Journals     = ""
-        }
-
         continue
     }
 
-    $ExpectedRvt = Join-Path $BackupFolder.Parent.FullName "$ModelName.rvt"
-    $RvtExists = Test-Path $ExpectedRvt
+    $ParentFolder = $BackupFolder.Parent.FullName
+    $ExactRvt = Join-Path $ParentFolder "$ModelName.rvt"
+
+    $RvtFile = $null
+
+    if (Test-Path $ExactRvt) {
+        $RvtFile = Get-Item $ExactRvt
+    }
+    else {
+        $RvtFile = Get-ChildItem -Path $ParentFolder -File -Filter "*.rvt" -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.BaseName -like "$ModelName*" -or
+                $ModelName -like "$($_.BaseName)*" -or
+                $_.BaseName.Contains($ModelName) -or
+                $ModelName.Contains($_.BaseName)
+            } |
+            Select-Object -First 1
+    }
+
+    $RvtExists = $null -ne $RvtFile
 
     if ($RvtExists) {
         $FoundRvt++
-    }
 
-    $JournalMatches = @()
-
-    if ($RvtExists -and (Test-Path $JournalRoot)) {
-
-        $JournalFiles = Get-ChildItem -Path $JournalRoot -Recurse -File -Filter "*.txt" -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match "\\Journals\\" }
-
-        foreach ($Journal in $JournalFiles) {
-            try {
-                $FoundInJournal = Select-String `
-                    -Path $Journal.FullName `
-                    -Pattern $ModelName `
-                    -SimpleMatch `
-                    -Quiet `
-                    -ErrorAction SilentlyContinue
-
-                if ($FoundInJournal) {
-                    $JournalMatches += $Journal.FullName
-                }
-            }
-            catch {
-                continue
-            }
-        }
-    }
-
-    $Deleted = $false
-    $Status = ""
-
-    if ($RvtExists) {
         try {
             Remove-Item -Path $BackupFolder.FullName -Recurse -Force -ErrorAction Stop
             $DeletedBackups++
-            $Deleted = $true
-            $Status = "Deleted"
-
-            Write-Host "Удалена: $($BackupFolder.FullName)" -ForegroundColor Green
+            $Status = "Backup deleted"
+            Write-Host "Удалена backup папка: $($BackupFolder.FullName)" -ForegroundColor Green
         }
         catch {
-            $FailedDeletes++
-            $Status = "Delete failed: $($_.Exception.Message)"
-
-            Write-Host "Ошибка удаления: $($BackupFolder.FullName)" -ForegroundColor Red
+            $FailedBackups++
+            $Status = "Backup delete failed: $($_.Exception.Message)"
+            Write-Host "Ошибка удаления backup: $($BackupFolder.FullName)" -ForegroundColor Red
         }
     }
     else {
         $SkippedBackups++
         $Status = "Skipped: RVT not found"
-
-        Write-Host "Пропущена, RVT не найден: $($BackupFolder.FullName)" -ForegroundColor Yellow
+        Write-Host "Пропущена backup папка, RVT не найден: $($BackupFolder.FullName)" -ForegroundColor Yellow
     }
 
     $Results += [PSCustomObject]@{
-        BackupFolder = $BackupFolder.FullName
-        ModelName    = $ModelName
-        ExpectedRvt  = $ExpectedRvt
-        RvtExists    = $RvtExists
-        Deleted      = $Deleted
+        Type         = "BackupFolder"
+        Path         = $BackupFolder.FullName
+        RelatedRvt   = if ($RvtFile) { $RvtFile.FullName } else { "" }
+        Deleted      = $RvtExists
         Status       = $Status
-        Journals     = ($JournalMatches -join "; ")
+    }
+}
+
+Write-Host ""
+Write-Host "Поиск Revit journals..." -ForegroundColor Cyan
+
+if (Test-Path $JournalRoot) {
+    $JournalFiles = Get-ChildItem -Path $JournalRoot -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.DirectoryName -match "\\Journals$" -and
+            ($_.Name -like "journal*.txt" -or $_.Name -like "journal*.log")
+        }
+
+    $FoundJournals = $JournalFiles.Count
+
+    foreach ($Journal in $JournalFiles) {
+        try {
+            Remove-Item -Path $Journal.FullName -Force -ErrorAction Stop
+            $DeletedJournals++
+
+            Write-Host "Удален journal: $($Journal.FullName)" -ForegroundColor Green
+
+            $Results += [PSCustomObject]@{
+                Type         = "Journal"
+                Path         = $Journal.FullName
+                RelatedRvt   = ""
+                Deleted      = $true
+                Status       = "Journal deleted"
+            }
+        }
+        catch {
+            $FailedJournals++
+
+            Write-Host "Ошибка удаления journal: $($Journal.FullName)" -ForegroundColor Red
+
+            $Results += [PSCustomObject]@{
+                Type         = "Journal"
+                Path         = $Journal.FullName
+                RelatedRvt   = ""
+                Deleted      = $false
+                Status       = "Journal delete failed: $($_.Exception.Message)"
+            }
+        }
     }
 }
 
@@ -115,10 +131,15 @@ $Results | Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
 
 Write-Host ""
 Write-Host "========== ИТОГ ==========" -ForegroundColor Cyan
-Write-Host "Найдено backup папок : $FoundBackups"
-Write-Host "Найдено RVT файлов   : $FoundRvt"
-Write-Host "Удалено папок        : $DeletedBackups"
-Write-Host "Пропущено папок      : $SkippedBackups"
-Write-Host "Ошибок удаления      : $FailedDeletes"
-Write-Host "Отчет сохранен       : $ReportPath"
+Write-Host "Найдено backup папок  : $FoundBackups"
+Write-Host "Найдено RVT файлов    : $FoundRvt"
+Write-Host "Удалено backup папок  : $DeletedBackups"
+Write-Host "Пропущено backup папок: $SkippedBackups"
+Write-Host "Ошибок backup удаления: $FailedBackups"
+Write-Host ""
+Write-Host "Найдено journal файлов: $FoundJournals"
+Write-Host "Удалено journal файлов: $DeletedJournals"
+Write-Host "Ошибок journal удален.: $FailedJournals"
+Write-Host ""
+Write-Host "Отчет сохранен        : $ReportPath"
 Write-Host "=========================="
